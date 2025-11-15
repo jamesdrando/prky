@@ -17,7 +17,8 @@ import (
 var (
 	ErrNotFound        = errors.New("key not found")
 	ErrVersionMismatch = errors.New("version mismatch (optimistic lock failed)")
-	errCorruptLog      = errors.New("corrupt log file detected")
+	ErrCorruptLog      = errors.New("corrupt log file detected")
+	ErrValueTooLarge   = errors.New("value too large")
 )
 
 // Number of shards in the in-memory map.
@@ -51,6 +52,9 @@ type Store struct {
 	wg       sync.WaitGroup // Background goroutines.
 	quit     chan struct{}  // Signals background goroutines to stop.
 	hashSeed uint64         // Seed for key hashing (HashDoS protection).
+	maxValueBytes int       // Max value size 
+	hardValueLimit int      // Hard limit on value size (can modify but not recommended)
+
 
 	// WAL writer (group commit) infrastructure.
 	walCh      chan *walRequest
@@ -113,6 +117,8 @@ func NewStore(path string, compactionInterval time.Duration) (*Store, error) {
 			MaxBatchRecords: 1024,
 			MaxBatchBytes:   128 * 1024,
 		},
+		maxValueBytes: 128 * 1024,   // 128 KB soft limit
+		hardValueLimit: 4 * 1024 * 1024, // 4 MB hard limit
 		walCh: make(chan *walRequest, 4096),
 		hashSeed: seedVal.Uint64(),
 	}
@@ -161,6 +167,17 @@ func (s *Store) SetDurabilityConfig(cfg DurabilityConfig) {
 	s.durability = cfg
 }
 
+func (s *Store) SetMaxValueBytes(n int) error {
+    if n <= 0 {
+        return errors.New("MaxValueBytes must be positive")
+    }
+    if n > s.hardValueLimit {
+        return fmt.Errorf("MaxValueBytes exceeds hard limit (%d bytes)", s.hardValueLimit)
+    }
+    s.maxValueBytes = n
+    return nil
+}
+
 // replayLog scans the WAL from the beginning and reconstructs in-memory state.
 func (s *Store) replayLog() error {
 	if _, err := s.wal.Seek(0, io.SeekStart); err != nil {
@@ -176,7 +193,7 @@ func (s *Store) replayLog() error {
 			return nil
 		}
 		if err != nil {
-			return errCorruptLog
+			return ErrCorruptLog
 		}
 
 		keyLen := binary.LittleEndian.Uint32(header[0:])
@@ -186,21 +203,21 @@ func (s *Store) replayLog() error {
 		deleted := header[20] != 0
 
 		if keyLen == 0 {
-			return errCorruptLog
+			return ErrCorruptLog
 		}
 
 		keyBytes := make([]byte, keyLen)
 		if _, err := io.ReadFull(s.wal, keyBytes); err != nil {
-			return errCorruptLog
+			return ErrCorruptLog
 		}
 
 		valueBytes := make([]byte, valueLen)
 		if _, err := io.ReadFull(s.wal, valueBytes); err != nil {
-			return errCorruptLog
+			return ErrCorruptLog
 		}
 
 		if s.checksum(valueBytes) != checksum {
-			return errCorruptLog
+			return ErrCorruptLog
 		}
 
 		key := string(keyBytes)
@@ -245,6 +262,14 @@ func (s *Store) Get(key string) (int64, []byte, error) {
 // If the current version does not match expectedVersion, ErrVersionMismatch is returned.
 // The call blocks until the corresponding WAL batch has been flushed to disk.
 func (s *Store) Put(key string, value []byte, expectedVersion int64) error {
+	if len(value) > s.maxValueBytes {
+			return fmt.Errorf("%w: %d > %d", ErrValueTooLarge, len(value), s.maxValueBytes)
+	}
+
+	if len(value) > s.hardValueLimit {
+    panic("value size exceeded hard limit — this indicates a programmer error")
+	}
+	
 	sh := s.getShard(key)
 	sh.mux.Lock()
 	defer sh.mux.Unlock()

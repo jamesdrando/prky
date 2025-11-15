@@ -1,9 +1,8 @@
 package prky
 
 import (
-	"bytes"
 	"crypto/rand"
-	"encoding/gob"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"hash/crc32"
@@ -11,35 +10,23 @@ import (
 	"math/big"
 	"os"
 	"sync"
-	"time" // Added for compaction
+	"time"
 )
 
-// ## 1. Public Errors
+// Public errors.
 var (
 	ErrNotFound        = errors.New("key not found")
 	ErrVersionMismatch = errors.New("version mismatch (optimistic lock failed)")
 	errCorruptLog      = errors.New("corrupt log file detected")
 )
 
-// ## 2. Internal Data Structures
-
-const (
-	numShards = 256
-)
+// Number of shards in the in-memory map.
+const numShards = 256
 
 // internalEntry is the in-memory representation of a value.
 type internalEntry struct {
 	Version int64
 	Value   []byte
-}
-
-// logEntry is the on-disk representation written to the WAL.
-type logEntry struct {
-	Key      string
-	Value    []byte
-	Version  int64
-	Checksum uint32
-	Deleted  bool
 }
 
 // shard contains a single map and its dedicated lock.
@@ -48,23 +35,63 @@ type shard struct {
 	data map[string]internalEntry
 }
 
+// DurabilityConfig controls WAL group-commit behavior.
+type DurabilityConfig struct {
+	FlushInterval   time.Duration // Maximum time a write may wait before being flushed.
+	MaxBatchRecords int           // Maximum number of records per WAL batch.
+	MaxBatchBytes   int           // Maximum total bytes per WAL batch.
+}
+
 // Store is the main key-value store struct.
 type Store struct {
 	shards   [numShards]*shard
-	wal      *os.File       // The Write-Ahead Log file
-	walMux   sync.Mutex     // Protects all access to the WAL file
-	walEnc   *gob.Encoder   // A reusable gob encoder for the WAL
-	walPath  string         // Path to the WAL file
-	wg       sync.WaitGroup // To wait for background goroutines on Close
-	quit     chan struct{}  // To signal compaction to stop
-	hashSeed uint64         // Seed for hash function
+	wal      *os.File       // Write-ahead log file.
+	walMux   sync.Mutex     // Serializes WAL flushes and file swaps (compaction).
+	walPath  string         // Path to the WAL file.
+	wg       sync.WaitGroup // Background goroutines.
+	quit     chan struct{}  // Signals background goroutines to stop.
+	hashSeed uint64         // Seed for key hashing (HashDoS protection).
+
+	// WAL writer (group commit) infrastructure.
+	walCh      chan *walRequest
+	durability DurabilityConfig
 }
 
-// ## 3. Constructor and Initialization
+// Binary WAL format:
+//
+//   [0..3]   uint32  keyLen
+//   [4..7]   uint32  valueLen
+//   [8..15]  int64   version
+//   [16..19] uint32  checksum (CRC32)
+//   [20]     uint8   deleted (0 = false, 1 = true)
+//   [21..]   key bytes (keyLen)
+//   [...]    value bytes (valueLen)
+//
+// All fields are little-endian.
+
+type walRequest struct {
+	key     []byte
+	value   []byte
+	version int64
+	deleted bool
+	size    int        // Approximate total bytes for this record in WAL.
+	done    chan error // Signaled when the batch containing this record is durably flushed.
+}
+
+// Precomputed CRC32 table (Castagnoli polynomial, often hardware-accelerated).
+var crcTable = crc32.MakeTable(crc32.Castagnoli)
+
+// Buffer pool for WAL batching.
+var walBufPool = sync.Pool{
+	New: func() any {
+		b := make([]byte, 0, 128*1024) // Default starting capacity; grows as needed.
+		return &b
+	},
+}
 
 // NewStore creates or loads a key-value store from a WAL file.
-// It also takes a 'compactionInterval'. If > 0, it will
-// automatically compact the log file in the background.
+// If compactionInterval > 0, a background compaction goroutine will run.
+// Durability is enforced via a single WAL writer goroutine with group commit.
 func NewStore(path string, compactionInterval time.Duration) (*Store, error) {
 	walFile, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_APPEND, 0644)
 	if err != nil {
@@ -73,14 +100,20 @@ func NewStore(path string, compactionInterval time.Duration) (*Store, error) {
 
 	seedVal, err := rand.Int(rand.Reader, new(big.Int).SetUint64(0xFFFFFFFFFFFFFFFF))
 	if err != nil {
+		walFile.Close()
 		return nil, fmt.Errorf("failed to generate hash seed: %w", err)
 	}
 
 	s := &Store{
-		wal:      walFile,
-		walEnc:   gob.NewEncoder(walFile),
-		walPath:  path,
-		quit:     make(chan struct{}), // For signaling compaction goroutine
+		wal:     walFile,
+		walPath: path,
+		quit:    make(chan struct{}),
+		durability: DurabilityConfig{
+			FlushInterval:   200 * time.Microsecond,
+			MaxBatchRecords: 1024,
+			MaxBatchBytes:   128 * 1024,
+		},
+		walCh: make(chan *walRequest, 4096),
 		hashSeed: seedVal.Uint64(),
 	}
 
@@ -100,7 +133,11 @@ func NewStore(path string, compactionInterval time.Duration) (*Store, error) {
 		return nil, err
 	}
 
-	// --- Start background compaction loop ---
+	// WAL writer goroutine (group commit).
+	s.wg.Add(1)
+	go s.walLoop()
+
+	// Optional background compaction.
 	if compactionInterval > 0 {
 		s.wg.Add(1)
 		go s.compactionLoop(compactionInterval)
@@ -109,203 +146,333 @@ func NewStore(path string, compactionInterval time.Duration) (*Store, error) {
 	return s, nil
 }
 
-// replayLog reads the entire WAL, populating the in-memory state.
-// It now correctly handles delete tombstones.
+// SetDurabilityConfig allows overriding the default group-commit configuration.
+// This should be called soon after NewStore and before heavy use.
+func (s *Store) SetDurabilityConfig(cfg DurabilityConfig) {
+	if cfg.FlushInterval <= 0 {
+		cfg.FlushInterval = s.durability.FlushInterval
+	}
+	if cfg.MaxBatchRecords <= 0 {
+		cfg.MaxBatchRecords = s.durability.MaxBatchRecords
+	}
+	if cfg.MaxBatchBytes <= 0 {
+		cfg.MaxBatchBytes = s.durability.MaxBatchBytes
+	}
+	s.durability = cfg
+}
+
+// replayLog scans the WAL from the beginning and reconstructs in-memory state.
 func (s *Store) replayLog() error {
 	if _, err := s.wal.Seek(0, io.SeekStart); err != nil {
 		return err
 	}
 
-	dec := gob.NewDecoder(s.wal)
+	header := make([]byte, 21)
+
 	for {
-		var entry logEntry
-		err := dec.Decode(&entry)
-		if err == io.EOF {
-			break
+		_, err := io.ReadFull(s.wal, header)
+		if err == io.EOF || err == io.ErrUnexpectedEOF {
+			// Clean EOF: no more complete records.
+			return nil
 		}
 		if err != nil {
 			return errCorruptLog
 		}
 
-		// Verify Checksum
-		if s.checksum(entry.Value) != entry.Checksum {
+		keyLen := binary.LittleEndian.Uint32(header[0:])
+		valueLen := binary.LittleEndian.Uint32(header[4:])
+		version := int64(binary.LittleEndian.Uint64(header[8:]))
+		checksum := binary.LittleEndian.Uint32(header[16:])
+		deleted := header[20] != 0
+
+		if keyLen == 0 {
 			return errCorruptLog
 		}
 
-		shard := s.getShard(entry.Key)
+		keyBytes := make([]byte, keyLen)
+		if _, err := io.ReadFull(s.wal, keyBytes); err != nil {
+			return errCorruptLog
+		}
 
-		if entry.Deleted {
-			// If it's a delete, remove it from memory.
-			// We only care if the delete version is newer.
-			if current, ok := shard.data[entry.Key]; ok && entry.Version > current.Version {
-				delete(shard.data, entry.Key)
+		valueBytes := make([]byte, valueLen)
+		if _, err := io.ReadFull(s.wal, valueBytes); err != nil {
+			return errCorruptLog
+		}
+
+		if s.checksum(valueBytes) != checksum {
+			return errCorruptLog
+		}
+
+		key := string(keyBytes)
+		sh := s.getShard(key)
+
+		if deleted {
+			if cur, ok := sh.data[key]; ok && version > cur.Version {
+				delete(sh.data, key)
 			}
 		} else {
-			// It's a Put. Only update if newer.
-			if current, ok := shard.data[entry.Key]; !ok || entry.Version > current.Version {
-				shard.data[entry.Key] = internalEntry{
-					Version: entry.Version,
-					Value:   entry.Value,
+			cur, ok := sh.data[key]
+			if !ok || version > cur.Version {
+				sh.data[key] = internalEntry{
+					Version: version,
+					Value:   valueBytes,
 				}
 			}
 		}
 	}
-	return nil
 }
 
-// ## 4. Public API: Get, Put, Delete, Close
+// Get retrieves a value by key and returns its version and a copy of the value bytes.
+func (s *Store) Get(key string) (int64, []byte, error) {
+	sh := s.getShard(key)
 
-// Get retrieves a value by key.
-func (s *Store) Get(key string, target interface{}) (version int64, err error) {
-	shard := s.getShard(key)
-
-	// --- Critical section: Read lock ---
-	shard.mux.RLock()
-	entry, ok := shard.data[key]
+	sh.mux.RLock()
+	entry, ok := sh.data[key]
 	if !ok {
-		shard.mux.RUnlock() // Don't forget to unlock on failure!
-		return 0, ErrNotFound
+		sh.mux.RUnlock()
+		return 0, nil, ErrNotFound
 	}
-
-	// Copy the value and version, then release the lock
+	version := entry.Version
 	valueCopy := make([]byte, len(entry.Value))
 	copy(valueCopy, entry.Value)
-	version = entry.Version
-	shard.mux.RUnlock()
-	// --- End critical section ---
+	sh.mux.RUnlock()
 
-	// Decode outside the lock (to minimize lock hold time)
-	buf := bytes.NewBuffer(valueCopy)
-	if err := gob.NewDecoder(buf).Decode(target); err != nil {
-		return 0, err
-	}
-	return version, nil
+	return version, valueCopy, nil
 }
 
-// Put adds or updates a key with new data using optimistic locking.
-func (s *Store) Put(key string, data interface{}, expectedVersion int64) error {
-	var buf bytes.Buffer
-	if err := gob.NewEncoder(&buf).Encode(data); err != nil {
-		return err
-	}
-	valueBytes := buf.Bytes()
+// Put adds or updates a key with raw value bytes using optimistic locking.
+// expectedVersion == 0 means "insert if missing".
+// If the current version does not match expectedVersion, ErrVersionMismatch is returned.
+// The call blocks until the corresponding WAL batch has been flushed to disk.
+func (s *Store) Put(key string, value []byte, expectedVersion int64) error {
+	sh := s.getShard(key)
+	sh.mux.Lock()
+	defer sh.mux.Unlock()
 
-	shard := s.getShard(key)
-	shard.mux.Lock()
-	defer shard.mux.Unlock()
-
-	// --- Start of Atomic Transaction ---
 	currentVersion := int64(0)
-	if entry, ok := shard.data[key]; ok {
+	if entry, ok := sh.data[key]; ok {
 		currentVersion = entry.Version
 	}
-
 	if currentVersion != expectedVersion {
 		return ErrVersionMismatch
 	}
 
 	newVersion := currentVersion + 1
-	log := logEntry{
-		Key:      key,
-		Value:    valueBytes,
-		Version:  newVersion,
-		Checksum: s.checksum(valueBytes),
-		Deleted:  false, // MODIFIED: Explicitly set Deleted to false
+	valueCopy := make([]byte, len(value))
+	copy(valueCopy, value)
+
+	req := &walRequest{
+		key:     []byte(key),
+		value:   valueCopy,
+		version: newVersion,
+		deleted: false,
+		size:    21 + len(key) + len(valueCopy),
+		done:    make(chan error, 1),
 	}
 
-	// Write to WAL (Durability & Atomicity)
-	s.walMux.Lock()
-	err := s.walEnc.Encode(log)
-	if err != nil {
-		s.walMux.Unlock()
-		return err
+	// Enqueue WAL write and wait for durability.
+	select {
+	case s.walCh <- req:
+	case <-s.quit:
+		return errors.New("store closed")
 	}
-	if err := s.wal.Sync(); err != nil {
-		s.walMux.Unlock()
-		return err
-	}
-	s.walMux.Unlock()
 
-	// Update in-memory map
-	shard.data[key] = internalEntry{
+	if err := <-req.done; err != nil {
+		return err
+	}
+
+	// Only update in-memory state after the WAL is durable.
+	sh.data[key] = internalEntry{
 		Version: newVersion,
-		Value:   valueBytes,
+		Value:   valueCopy,
 	}
 
 	return nil
 }
 
 // Delete removes a key from the store using optimistic locking.
-// It requires the 'expectedVersion' to match the current version.
-// It writes a "tombstone" record to the WAL for durability.
+// It writes a tombstone to the WAL and blocks until the batch is flushed.
 func (s *Store) Delete(key string, expectedVersion int64) error {
-	shard := s.getShard(key)
-	shard.mux.Lock()
-	defer shard.mux.Unlock()
+	sh := s.getShard(key)
+	sh.mux.Lock()
+	defer sh.mux.Unlock()
 
-	// --- Start of Atomic Transaction ---
-
-	// 1. Check version
-	currentVersion := int64(0)
-	if entry, ok := shard.data[key]; ok {
-		currentVersion = entry.Version
-	} else {
-		// Key doesn't exist, so we can't delete it.
+	entry, ok := sh.data[key]
+	if !ok {
 		return ErrNotFound
 	}
-
-	if currentVersion != expectedVersion {
+	if entry.Version != expectedVersion {
 		return ErrVersionMismatch
 	}
 
-	// 2. Prepare tombstone log entry
-	newVersion := currentVersion + 1
-	log := logEntry{
-		Key:      key,
-		Value:    nil, // No value for a delete
-		Version:  newVersion,
-		Checksum: s.checksum(nil), // Checksum of nil
-		Deleted:  true,
+	newVersion := entry.Version + 1
+
+	req := &walRequest{
+		key:     []byte(key),
+		value:   nil,
+		version: newVersion,
+		deleted: true,
+		size:    21 + len(key),
+		done:    make(chan error, 1),
 	}
 
-	// 3. Write to WAL (Durability & Atomicity)
-	s.walMux.Lock()
-	err := s.walEnc.Encode(log)
-	if err != nil {
-		s.walMux.Unlock()
+	// Enqueue WAL write and wait for durability.
+	select {
+	case s.walCh <- req:
+	case <-s.quit:
+		return errors.New("store closed")
+	}
+
+	if err := <-req.done; err != nil {
 		return err
 	}
-	if err := s.wal.Sync(); err != nil {
-		s.walMux.Unlock()
-		return err
-	}
-	s.walMux.Unlock()
 
-	// 4. Update in-memory map
-	delete(shard.data, key)
-
+	delete(sh.data, key)
 	return nil
 }
 
 // Close gracefully shuts down the database.
-// It now signals the compaction loop to stop and waits for it.
+// It signals background goroutines to stop, flushes pending WAL writes,
+// and closes the WAL file.
 func (s *Store) Close() error {
-	// --- MODIFIED: Signal background goroutines to stop ---
 	if s.quit != nil {
-		close(s.quit) // Signal compaction to stop
-		s.wg.Wait()   // Wait for it to finish
+		close(s.quit)
 	}
+	if s.walCh != nil {
+		close(s.walCh)
+	}
+
+	s.wg.Wait()
 
 	s.walMux.Lock()
 	defer s.walMux.Unlock()
-	return s.wal.Close()
+	if s.wal != nil {
+		return s.wal.Close()
+	}
+	return nil
 }
 
-// ## 5. Compaction
+// walLoop is the single WAL writer goroutine responsible for group commit.
+// It batches incoming requests based on count, size, and time.
+func (s *Store) walLoop() {
+	defer s.wg.Done()
 
-// compactionLoop runs in a background goroutine.
+	cfg := s.durability
+	if cfg.FlushInterval <= 0 {
+		cfg.FlushInterval = 200 * time.Microsecond
+	}
+	if cfg.MaxBatchRecords <= 0 {
+		cfg.MaxBatchRecords = 1024
+	}
+	if cfg.MaxBatchBytes <= 0 {
+		cfg.MaxBatchBytes = 128 * 1024
+	}
+
+	timer := time.NewTimer(cfg.FlushInterval)
+	defer timer.Stop()
+
+	var (
+		pending      []*walRequest
+		pendingBytes int
+	)
+
+	flush := func() {
+		if len(pending) == 0 {
+			return
+		}
+
+		// Build a single buffer for the entire batch.
+		bufPtr := walBufPool.Get().(*[]byte)
+		buf := (*bufPtr)[:0]
+
+		for _, req := range pending {
+			var header [21]byte
+			binary.LittleEndian.PutUint32(header[0:], uint32(len(req.key)))
+			binary.LittleEndian.PutUint32(header[4:], uint32(len(req.value)))
+			binary.LittleEndian.PutUint64(header[8:], uint64(req.version))
+			binary.LittleEndian.PutUint32(header[16:], s.checksum(req.value))
+			if req.deleted {
+				header[20] = 1
+			} else {
+				header[20] = 0
+			}
+
+			buf = append(buf, header[:]...)
+			buf = append(buf, req.key...)
+			buf = append(buf, req.value...)
+		}
+
+		s.walMux.Lock()
+		_, writeErr := s.wal.Write(buf)
+		if writeErr == nil {
+			writeErr = s.wal.Sync()
+		}
+		s.walMux.Unlock()
+
+		for _, req := range pending {
+			req.done <- writeErr
+		}
+
+		*bufPtr = buf[:0]
+		walBufPool.Put(bufPtr)
+
+		pending = pending[:0]
+		pendingBytes = 0
+	}
+
+	for {
+		select {
+		case req, ok := <-s.walCh:
+			if !ok {
+				// Flush any remaining entries before exit.
+				flush()
+				return
+			}
+
+			pending = append(pending, req)
+			pendingBytes += req.size
+
+			if len(pending) >= cfg.MaxBatchRecords || pendingBytes >= cfg.MaxBatchBytes {
+				flush()
+				if !timer.Stop() {
+					select {
+					case <-timer.C:
+					default:
+					}
+				}
+				timer.Reset(cfg.FlushInterval)
+			}
+
+		case <-timer.C:
+			if len(pending) > 0 {
+				flush()
+			}
+			timer.Reset(cfg.FlushInterval)
+
+		case <-s.quit:
+			// Drain any remaining requests, then flush, then exit.
+			for {
+				select {
+				case req, ok := <-s.walCh:
+					if !ok {
+						flush()
+						return
+					}
+					pending = append(pending, req)
+					pendingBytes += req.size
+				default:
+					flush()
+					return
+				}
+			}
+		}
+	}
+}
+
+// compactionLoop runs periodic log compaction.
 func (s *Store) compactionLoop(interval time.Duration) {
 	defer s.wg.Done()
+
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
@@ -313,54 +480,33 @@ func (s *Store) compactionLoop(interval time.Duration) {
 		select {
 		case <-ticker.C:
 			if err := s.Compact(); err != nil {
-				// In a real-world scenario, log this error
 				fmt.Fprintf(os.Stderr, "kvstore: compaction failed: %v\n", err)
 			}
 		case <-s.quit:
-			return // Exit loop on Close()
+			return
 		}
 	}
 }
 
-// unlockAllShards is a helper to unlock all shards during compaction.
-func (s *Store) unlockAllShards() {
-	for i := len(s.shards) - 1; i >= 0; i-- {
-		s.shards[i].mux.Unlock()
-	}
-}
-
-// Compact performs a "Stop-the-World" compaction.
-// It locks the entire database, writes a new WAL with only
-// live data, and atomically swaps it with the old one.
+// Compact performs stop-the-world compaction by writing a new WAL containing
+// only the latest live entries and atomically swapping it into place.
 func (s *Store) Compact() error {
-	// 1. Open a new temporary WAL file
 	compactPath := s.walPath + ".compact"
 	compactFile, err := os.OpenFile(compactPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0644)
 	if err != nil {
 		return fmt.Errorf("failed to create compact file: %w", err)
 	}
-	compactEnc := gob.NewEncoder(compactFile)
 
-	// --- 2. Stop The World ---
-	// Acquire locks in a consistent order to prevent deadlock.
-	for _, shard := range s.shards {
-		shard.mux.Lock()
+	// Stop-the-world: lock shards and WAL in a fixed order.
+	for _, sh := range s.shards {
+		sh.mux.Lock()
 	}
 	s.walMux.Lock()
 
-	// 3. Write snapshot of live data to new WAL
-	for _, shard := range s.shards {
-		for key, entry := range shard.data {
-			// We only write live (non-deleted) entries
-			log := logEntry{
-				Key:      key,
-				Value:    entry.Value,
-				Version:  entry.Version,
-				Checksum: s.checksum(entry.Value),
-				Deleted:  false,
-			}
-			if err := compactEnc.Encode(log); err != nil {
-				// On error, abort compaction and unlock
+	// Write a snapshot of live data.
+	for _, sh := range s.shards {
+		for key, entry := range sh.data {
+			if err := writeLogEntryToFile(compactFile, key, entry.Value, entry.Version, false); err != nil {
 				compactFile.Close()
 				os.Remove(compactPath)
 				s.unlockAllShards()
@@ -370,7 +516,6 @@ func (s *Store) Compact() error {
 		}
 	}
 
-	// 4. Force new WAL to disk
 	if err := compactFile.Sync(); err != nil {
 		compactFile.Close()
 		os.Remove(compactPath)
@@ -378,81 +523,96 @@ func (s *Store) Compact() error {
 		s.walMux.Unlock()
 		return fmt.Errorf("failed to sync compact file: %w", err)
 	}
-	compactFile.Close() // Close file handle before renaming
+	compactFile.Close()
 
-	// 5. Atomically swap WAL files
 	oldWalPath := s.walPath + ".old"
 	if err := s.wal.Close(); err != nil {
-		// This is tricky. We've written the new log but can't close the old.
-		// We'll proceed, but log the error.
 		fmt.Fprintf(os.Stderr, "kvstore: failed to close old WAL: %v\n", err)
 	}
 
-	// Rename old log
 	if err := os.Rename(s.walPath, oldWalPath); err != nil {
-		// This is bad. We can't swap. Try to reopen old wal.
 		s.wal, _ = os.OpenFile(s.walPath, os.O_RDWR|os.O_APPEND, 0644)
-		s.walEnc = gob.NewEncoder(s.wal)
 		s.unlockAllShards()
 		s.walMux.Unlock()
 		return fmt.Errorf("failed to rename old WAL: %w", err)
 	}
 
-	// Rename new log to be the active log
 	if err := os.Rename(compactPath, s.walPath); err != nil {
-		// This is catastrophic. Try to rename old log back.
-		os.Rename(oldWalPath, s.walPath)
+		_ = os.Rename(oldWalPath, s.walPath)
 		s.wal, _ = os.OpenFile(s.walPath, os.O_RDWR|os.O_APPEND, 0644)
-		s.walEnc = gob.NewEncoder(s.wal)
 		s.unlockAllShards()
 		s.walMux.Unlock()
 		return fmt.Errorf("failed to rename new WAL: %w", err)
 	}
 
-	// 6. Open the new WAL file for appending
 	newWalFile, err := os.OpenFile(s.walPath, os.O_RDWR|os.O_APPEND, 0644)
 	if err != nil {
-		// This is also catastrophic.
 		s.unlockAllShards()
 		s.walMux.Unlock()
 		return fmt.Errorf("failed to reopen new WAL: %w", err)
 	}
-
 	s.wal = newWalFile
-	s.walEnc = gob.NewEncoder(s.wal)
 
-	// --- 7. Restart The World ---
 	s.walMux.Unlock()
 	s.unlockAllShards()
 
-	// 8. Cleanup old file
-	os.Remove(oldWalPath)
-
+	_ = os.Remove(oldWalPath)
 	return nil
 }
 
-// ## 6. Internal Helpers
-
-// checksum is a helper to compute the CRC32 checksum.
-func (s *Store) checksum(data []byte) uint32 {
-	h := crc32.NewIEEE()
-	h.Write(data) // Write(nil) is valid
-	return h.Sum32()
+// unlockAllShards unlocks all shard mutexes in reverse order.
+func (s *Store) unlockAllShards() {
+	for i := len(s.shards) - 1; i >= 0; i-- {
+		s.shards[i].mux.Unlock()
+	}
 }
 
-// getShard maps a key to its designated shard.
+// writeLogEntryToFile writes a single WAL entry to an arbitrary file descriptor
+// without touching Store state. Used by compaction.
+func writeLogEntryToFile(f *os.File, key string, value []byte, version int64, deleted bool) error {
+	keyBytes := []byte(key)
+
+	var header [21]byte
+	binary.LittleEndian.PutUint32(header[0:], uint32(len(keyBytes)))
+	binary.LittleEndian.PutUint32(header[4:], uint32(len(value)))
+	binary.LittleEndian.PutUint64(header[8:], uint64(version))
+	binary.LittleEndian.PutUint32(header[16:], crc32.Checksum(value, crcTable))
+	if deleted {
+		header[20] = 1
+	} else {
+		header[20] = 0
+	}
+
+	if _, err := f.Write(header[:]); err != nil {
+		return err
+	}
+	if _, err := f.Write(keyBytes); err != nil {
+		return err
+	}
+	if _, err := f.Write(value); err != nil {
+		return err
+	}
+	return nil
+}
+
+// checksum computes a CRC32 checksum over the given data using a shared table.
+func (s *Store) checksum(data []byte) uint32 {
+	return crc32.Checksum(data, crcTable)
+}
+
+// getShard maps a key to its designated shard using a seeded FNV-1a hash.
 func (s *Store) getShard(key string) *shard {
 	hash := fnv1a(key, s.hashSeed)
 	index := hash % uint64(numShards)
 	return s.shards[index]
 }
 
-// simple, non-cryptographic hash function.
+// fnv1a is a simple, seeded, non-cryptographic hash function used for sharding.
+// The random seed helps mitigate hash collision attacks.
 func fnv1a(s string, seed uint64) uint64 {
 	const prime = 1099511628211
 
-	hash := seed // Start with the random seed to prevent HashDoS attacks
-
+	hash := seed
 	for i := 0; i < len(s); i++ {
 		hash ^= uint64(s[i])
 		hash *= prime

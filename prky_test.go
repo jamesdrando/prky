@@ -170,7 +170,20 @@ func TestDelete(t *testing.T) {
 // TestPersistence checks if data is correctly reloaded from the WAL.
 func TestPersistence(t *testing.T) {
 	t.Parallel()
-	store, path, cleanup := tempStore(t, 0)
+	// --- MODIFIED: We will not use the 'cleanup' func from tempStore
+	// We need to manage the file path manually for this test.
+	f, err := os.CreateTemp("", "prky_test_*.wal")
+	if err != nil {
+		t.Fatalf("Failed to create temp WAL file: %v", err)
+	}
+	path := f.Name()
+	f.Close() // Close it so NewStore can open it
+
+	store, err := NewStore(path, 0)
+	if err != nil {
+		os.Remove(path) //nolint:errcheck
+		t.Fatalf("Failed to create new store: %v", err)
+	}
 
 	// 1. Perform a series of operations
 	// key1: v0 -> v1 (A) -> v2 (B)
@@ -188,13 +201,17 @@ func TestPersistence(t *testing.T) {
 	store.Put("key3", putD, 0) //nolint:errcheck
 
 	// 2. Close the store
-	cleanup() // This calls Close() and *keeps* the file
+	// --- MODIFIED: Do NOT call cleanup(). Just call Close().
+	if err := store.Close(); err != nil {
+		t.Fatalf("Failed to close store: %v", err)
+	}
 
 	// 3. Re-open the store from the same WAL file
 	store2, err := NewStore(path, 0)
 	if err != nil {
 		t.Fatalf("Failed to reopen store: %v", err)
 	}
+	// --- MODIFIED: Defer cleanup for store2 and the files
 	defer store2.Close()  //nolint:errcheck
 	defer os.Remove(path) //nolint:errcheck
 
@@ -235,7 +252,20 @@ func TestPersistence(t *testing.T) {
 // TestCompaction checks if the log is correctly compacted.
 func TestCompaction(t *testing.T) {
 	t.Parallel()
-	store, path, cleanup := tempStore(t, 0) // No background compaction
+	// --- MODIFIED: We will not use the 'cleanup' func from tempStore
+	// We need to manage the file path manually for this test.
+	f, err := os.CreateTemp("", "prky_test_*.wal")
+	if err != nil {
+		t.Fatalf("Failed to create temp WAL file: %v", err)
+	}
+	path := f.Name()
+	f.Close() // Close it so NewStore can open it
+
+	store, err := NewStore(path, 0)
+	if err != nil {
+		os.Remove(path) //nolint:errcheck
+		t.Fatalf("Failed to create new store: %v", err)
+	}
 
 	// 1. Create a "dirty" log
 	store.Put("key1", TestData{"A", 1}, 0) // v1
@@ -250,13 +280,20 @@ func TestCompaction(t *testing.T) {
 	}
 
 	// 3. Close and reopen to force replay from the *new* WAL
-	cleanup()
+	// --- MODIFIED: Do NOT call cleanup(). Just call Close().
+	if err := store.Close(); err != nil {
+		t.Fatalf("Failed to close store: %v", err)
+	}
+
 	store2, err := NewStore(path, 0)
 	if err != nil {
 		t.Fatalf("Failed to reopen store after compaction: %v", err)
 	}
-	defer store2.Close()  //nolint:errcheck
-	defer os.Remove(path) //nolint:errcheck
+	// --- MODIFIED: Defer cleanup for store2 and the files
+	defer store2.Close()               //nolint:errcheck
+	defer os.Remove(path)              //nolint:errcheck
+	defer os.Remove(path + ".compact") //nolint:errcheck
+	defer os.Remove(path + ".old")     //nolint:errcheck
 
 	// 4. Verify state (same as persistence test)
 	var getData TestData

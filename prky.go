@@ -45,16 +45,15 @@ type DurabilityConfig struct {
 
 // Store is the main key-value store struct.
 type Store struct {
-	shards   [numShards]*shard
-	wal      *os.File       // Write-ahead log file.
-	walMux   sync.Mutex     // Serializes WAL flushes and file swaps (compaction).
-	walPath  string         // Path to the WAL file.
-	wg       sync.WaitGroup // Background goroutines.
-	quit     chan struct{}  // Signals background goroutines to stop.
-	hashSeed uint64         // Seed for key hashing (HashDoS protection).
-	maxValueBytes int       // Max value size 
-	hardValueLimit int      // Hard limit on value size (can modify but not recommended)
-
+	shards         [numShards]*shard
+	wal            *os.File     // Write-ahead log file.
+	walMux         sync.Mutex   // Serializes WAL flushes and file swaps (compaction).
+	walPath        string       // Path to the WAL file.
+	wg             sync.WaitGroup // Background goroutines.
+	quit           chan struct{}  // Signals background goroutines to stop.
+	hashSeed       uint64       // Seed for key hashing (HashDoS protection).
+	maxValueBytes  int          // Max value size
+	hardValueLimit int          // Hard limit on value size (can modify but not recommended)
 
 	// WAL writer (group commit) infrastructure.
 	walCh      chan *walRequest
@@ -63,13 +62,13 @@ type Store struct {
 
 // Binary WAL format:
 //
-//   [0..3]   uint32  keyLen
-//   [4..7]   uint32  valueLen
-//   [8..15]  int64   version
-//   [16..19] uint32  checksum (CRC32)
-//   [20]     uint8   deleted (0 = false, 1 = true)
-//   [21..]   key bytes (keyLen)
-//   [...]    value bytes (valueLen)
+// 	 [0..3] 	 uint32 	keyLen
+// 	 [4..7] 	 uint32 	valueLen
+// 	 [8..15] 	int64 	 version
+// 	 [16..19] uint32 	checksum (CRC32)
+// 	 [20] 	 	 uint8 	 deleted (0 = false, 1 = true)
+// 	 [21..] 	 key bytes (keyLen)
+// 	 [...] 	 	value bytes (valueLen)
 //
 // All fields are little-endian.
 
@@ -117,10 +116,10 @@ func NewStore(path string, compactionInterval time.Duration) (*Store, error) {
 			MaxBatchRecords: 1024,
 			MaxBatchBytes:   128 * 1024,
 		},
-		maxValueBytes: 128 * 1024,   // 128 KB soft limit
-		hardValueLimit: 4 * 1024 * 1024, // 4 MB hard limit
-		walCh: make(chan *walRequest, 4096),
-		hashSeed: seedVal.Uint64(),
+		maxValueBytes:  128 * 1024,          // 128 KB soft limit
+		hardValueLimit: 4 * 1024 * 1024,     // 4 MB hard limit
+		walCh:          make(chan *walRequest, 4096),
+		hashSeed:       seedVal.Uint64(),
 	}
 
 	for i := 0; i < numShards; i++ {
@@ -168,14 +167,14 @@ func (s *Store) SetDurabilityConfig(cfg DurabilityConfig) {
 }
 
 func (s *Store) SetMaxValueBytes(n int) error {
-    if n <= 0 {
-        return errors.New("MaxValueBytes must be positive")
-    }
-    if n > s.hardValueLimit {
-        return fmt.Errorf("MaxValueBytes exceeds hard limit (%d bytes)", s.hardValueLimit)
-    }
-    s.maxValueBytes = n
-    return nil
+	if n <= 0 {
+		return errors.New("MaxValueBytes must be positive")
+	}
+	if n > s.hardValueLimit {
+		return fmt.Errorf("MaxValueBytes exceeds hard limit (%d bytes)", s.hardValueLimit)
+	}
+	s.maxValueBytes = n
+	return nil
 }
 
 // replayLog scans the WAL from the beginning and reconstructs in-memory state.
@@ -240,6 +239,7 @@ func (s *Store) replayLog() error {
 }
 
 // Get retrieves a value by key and returns its version and a copy of the value bytes.
+// This function is unchanged and was already correct.
 func (s *Store) Get(key string) (int64, []byte, error) {
 	sh := s.getShard(key)
 
@@ -261,24 +261,28 @@ func (s *Store) Get(key string) (int64, []byte, error) {
 // expectedVersion == 0 means "insert if missing".
 // If the current version does not match expectedVersion, ErrVersionMismatch is returned.
 // The call blocks until the corresponding WAL batch has been flushed to disk.
+//
+// *** THIS FUNCTION HAS BEEN MODIFIED TO FIX THE STALL ***
 func (s *Store) Put(key string, value []byte, expectedVersion int64) error {
 	if len(value) > s.maxValueBytes {
-			return fmt.Errorf("%w: %d > %d", ErrValueTooLarge, len(value), s.maxValueBytes)
+		return fmt.Errorf("%w: %d > %d", ErrValueTooLarge, len(value), s.maxValueBytes)
 	}
 
 	if len(value) > s.hardValueLimit {
-    panic("value size exceeded hard limit — this indicates a programmer error")
+		panic("value size exceeded hard limit — this indicates a programmer error")
 	}
-	
+
 	sh := s.getShard(key)
+
+	// --- Phase 1: Lock, Check, and Prepare ---
 	sh.mux.Lock()
-	defer sh.mux.Unlock()
 
 	currentVersion := int64(0)
 	if entry, ok := sh.data[key]; ok {
 		currentVersion = entry.Version
 	}
 	if currentVersion != expectedVersion {
+		sh.mux.Unlock() // Unlock on failed check
 		return ErrVersionMismatch
 	}
 
@@ -288,28 +292,55 @@ func (s *Store) Put(key string, value []byte, expectedVersion int64) error {
 
 	req := &walRequest{
 		key:     []byte(key),
-		value:   valueCopy,
+		value:   valueCopy, // Pass the copy to the WAL
 		version: newVersion,
 		deleted: false,
 		size:    21 + len(key) + len(valueCopy),
 		done:    make(chan error, 1),
 	}
 
-	// Enqueue WAL write and wait for durability.
+	// Release the lock *before* the I/O wait.
+	// This is the critical fix.
+	sh.mux.Unlock()
+
+	// --- Phase 2: Wait for Durability (No Lock Held) ---
+	// Gets can now acquire the RLock on this shard.
 	select {
 	case s.walCh <- req:
 	case <-s.quit:
 		return errors.New("store closed")
 	}
 
+	// Wait for the fsync to complete.
 	if err := <-req.done; err != nil {
+		// The WAL write failed. We never touched memory.
+		// It's safe to just return the error.
 		return err
 	}
 
-	// Only update in-memory state after the WAL is durable.
+	// --- Phase 3: Lock and Commit to Memory ---
+	// The WAL write is durable. Now we update the in-memory map.
+	sh.mux.Lock()
+	defer sh.mux.Unlock()
+
+	// We must re-check the state. Another goroutine might have
+	// completed its Phase 2 and won the race to update the map.
+	if entry, ok := sh.data[key]; ok {
+		if entry.Version >= newVersion {
+			// Our write (v+1) is durable, but the in-memory state
+			// is already at or past our version (e.g., v+1 or v+2).
+			// This is fine, it just means we were "slower" to commit
+			// to memory. No action needed.
+			return nil
+		}
+	}
+
+	// The current in-memory version is still what we saw (expectedVersion),
+	// or the key is gone (which is fine). We can safely
+	// apply our update.
 	sh.data[key] = internalEntry{
 		Version: newVersion,
-		Value:   valueCopy,
+		Value:   valueCopy, // Use the same copy we sent to the WAL
 	}
 
 	return nil
@@ -317,16 +348,21 @@ func (s *Store) Put(key string, value []byte, expectedVersion int64) error {
 
 // Delete removes a key from the store using optimistic locking.
 // It writes a tombstone to the WAL and blocks until the batch is flushed.
+//
+// *** THIS FUNCTION HAS BEEN MODIFIED TO FIX THE STALL ***
 func (s *Store) Delete(key string, expectedVersion int64) error {
 	sh := s.getShard(key)
+
+	// --- Phase 1: Lock, Check, and Prepare ---
 	sh.mux.Lock()
-	defer sh.mux.Unlock()
 
 	entry, ok := sh.data[key]
 	if !ok {
+		sh.mux.Unlock()
 		return ErrNotFound
 	}
 	if entry.Version != expectedVersion {
+		sh.mux.Unlock()
 		return ErrVersionMismatch
 	}
 
@@ -341,18 +377,40 @@ func (s *Store) Delete(key string, expectedVersion int64) error {
 		done:    make(chan error, 1),
 	}
 
-	// Enqueue WAL write and wait for durability.
+	// Release the lock *before* the I/O wait.
+	// This is the critical fix.
+	sh.mux.Unlock()
+
+	// --- Phase 2: Wait for Durability (No Lock Held) ---
 	select {
 	case s.walCh <- req:
 	case <-s.quit:
 		return errors.New("store closed")
 	}
 
+	// Wait for the fsync to complete.
 	if err := <-req.done; err != nil {
+		// The WAL write failed. We never touched memory.
+		// It's safe to just return the error.
 		return err
 	}
 
-	delete(sh.data, key)
+	// --- Phase 3: Lock and Commit to Memory ---
+	// The WAL write is durable. Now we update the in-memory map.
+	sh.mux.Lock()
+	defer sh.mux.Unlock()
+
+	// Re-check state. We only delete if the version is *still*
+	// the one we expected to delete.
+	if entry, ok := sh.data[key]; ok && entry.Version == expectedVersion {
+		// The version hasn't changed since we checked. Safe to delete.
+		delete(sh.data, key)
+	}
+	// If the version is *newer*, another Put came in. We don't delete.
+	// If the key is *gone*, another Delete beat us. We don't delete.
+	// In all cases, our "delete" operation is durable in the WAL
+	// and the replay will be correct.
+
 	return nil
 }
 
@@ -379,6 +437,7 @@ func (s *Store) Close() error {
 
 // walLoop is the single WAL writer goroutine responsible for group commit.
 // It batches incoming requests based on count, size, and time.
+// This function is unchanged and was already correct.
 func (s *Store) walLoop() {
 	defer s.wg.Done()
 

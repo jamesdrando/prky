@@ -9,6 +9,7 @@ import (
 	"io"
 	"math/big"
 	"os"
+	"runtime"
 	"sync"
 	"time"
 )
@@ -545,7 +546,8 @@ func (s *Store) walLoop(w *walWriter) {
         // We still use a global walMux here so compaction can stop the world.
         s.walMux.Lock()
         _, writeErr := w.file.Write(buf)
-        if writeErr == nil {
+
+        if writeErr == nil && runtime.GOOS != "windows" {
             writeErr = w.file.Sync()
         }
         s.walMux.Unlock()

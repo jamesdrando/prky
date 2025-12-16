@@ -69,13 +69,13 @@ type Store struct {
 
 // Binary WAL format:
 //
-// 	 [0..3] 	 uint32 	keyLen
-// 	 [4..7] 	 uint32 	valueLen
-// 	 [8..15] 	int64 	 version
-// 	 [16..19] uint32 	checksum (CRC32)
-// 	 [20] 	 	 uint8 	 deleted (0 = false, 1 = true)
-// 	 [21..] 	 key bytes (keyLen)
-// 	 [...] 	 	value bytes (valueLen)
+// 	 [0..3]		uint32			keyLen
+// 	 [4..7]		uint32			valueLen
+// 	 [8..15]	int64			version
+// 	 [16..19]	uint32			checksum (CRC32)
+// 	 [20]		uint8			deleted (0 = false, 1 = true)
+// 	 [21..]		key bytes		(keyLen)
+// 	 [...]		value bytes		(valueLen)
 //
 // All fields are little-endian.
 
